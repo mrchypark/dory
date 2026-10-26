@@ -23,10 +23,8 @@ enum DorydLaunchAgent {
             .appendingPathComponent("d", isDirectory: true)
             .standardizedFileURL
     }
-    // Docker gets 20 seconds, dory-hv gets 25, and doryd gets 30 before its own last resort.
-    // launchd's system default is only five seconds on current macOS, so make upgrade/logout
-    // replacement honor the same graceful shutdown contract as an explicit engine stop.
-    static let exitTimeoutSeconds = 45
+    // Leave ten seconds beyond doryd's 60-second host termination budget for upgrade/logout.
+    static let exitTimeoutSeconds = 70
     private static let bootstrapRetryCount = 20
 
     struct Install: Sendable, Equatable {

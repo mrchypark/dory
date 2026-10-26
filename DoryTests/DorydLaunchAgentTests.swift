@@ -5,6 +5,47 @@ import Testing
 
 @MainActor
 struct DorydLaunchAgentTests {
+    @Test func launchdPlistBudgetsCoverTheActualHostShutdownDeadline() throws {
+        let repository = ProcessInfo.processInfo.environment["DORY_TEST_REPO_ROOT"].map { URL(fileURLWithPath: $0) }
+            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let timing = try String(
+            contentsOf: repository.appendingPathComponent("dory-core-swift/Sources/DoryCore/DoryEngineShutdownTiming.swift"),
+            encoding: .utf8
+        )
+        func seconds(_ name: String) throws -> Int {
+            let line = try #require(timing.split(separator: "\n").first { $0.contains("let \(name):") })
+            let value = try #require(line.split(separator: "=").last)
+            return try #require(Int(value.trimmingCharacters(in: .whitespaces)))
+        }
+        let hostSeconds = try seconds("hostTerminationSeconds")
+        #expect(hostSeconds > (try seconds("helperWatchdogSeconds")))
+        var plists = [
+            DorydLaunchAgent.launchAgentPlist(
+                program: "/Applications/Dory.app/Contents/Helpers/doryd",
+                helpersDirectory: URL(fileURLWithPath: "/Applications/Dory.app/Contents/Helpers")
+            ),
+            try String(contentsOf: repository.appendingPathComponent("dory-core-swift/launchd/dev.dory.doryd.plist"), encoding: .utf8),
+        ]
+        for path in ["scripts/build.sh", "scripts/bundle-engine.sh"] {
+            let source = try String(contentsOf: repository.appendingPathComponent(path), encoding: .utf8)
+            let templates = source.components(separatedBy: "<?xml").dropFirst().compactMap { section -> String? in
+                guard let end = section.range(of: "</plist>") else { return nil }
+                let xml = "<?xml" + section[..<end.upperBound]
+                return xml.contains("<key>ExitTimeOut</key>") ? xml : nil
+            }
+            #expect(templates.count == 1)
+            plists.append(contentsOf: templates)
+        }
+        for plist in plists {
+            let root = try #require(
+                PropertyListSerialization.propertyList(from: Data(plist.utf8), options: [], format: nil) as? [String: Any]
+            )
+            let timeout = try #require(root["ExitTimeOut"] as? Int)
+            #expect(timeout == DorydLaunchAgent.exitTimeoutSeconds)
+            #expect(timeout >= hostSeconds + 10)
+        }
+    }
+
     @Test func launchAgentPrefersRetinaCapableVMMApplication() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("DoryVMMBundle-\(UUID().uuidString)", isDirectory: true)
@@ -534,7 +575,7 @@ struct DorydLaunchAgentTests {
         #expect(plist.contains("<string>4096</string>"))
         #expect(plist.contains("<key>ExitTimeOut</key>"))
         #expect(plist.contains("<integer>\(DorydLaunchAgent.exitTimeoutSeconds)</integer>"))
-        #expect(DorydLaunchAgent.exitTimeoutSeconds > 30)
+        #expect(DorydLaunchAgent.exitTimeoutSeconds >= 70)
     }
 
     @Test func launchAgentCarriesExplicitPersistedEngineChoices() throws {
