@@ -10,8 +10,7 @@ final class DoryEngineShutdownTimingTests: XCTestCase {
                 + 2 + 5 // bounded trim and filesystem sync/unmount margin
         )
         XCTAssertGreaterThanOrEqual(DoryEngineShutdownTiming.reloadGraceSeconds,
-            3 + Double(DoryEngineShutdownTiming.reloadPollAttempts) * 2
-                + Double(DoryEngineShutdownTiming.reloadPollAttempts - 1) * DoryEngineShutdownTiming.pollIntervalSeconds)
+            3 + 2 + DoryEngineShutdownTiming.pollIntervalSeconds)
         XCTAssertGreaterThan(
             DoryEngineShutdownTiming.hostTerminationSeconds,
             DoryEngineShutdownTiming.helperWatchdogSeconds

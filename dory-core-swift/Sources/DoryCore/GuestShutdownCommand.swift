@@ -53,6 +53,10 @@ public enum GuestShutdownCommand {
     static func shutdownSequence() -> String {
         let interval = DoryEngineShutdownTiming.pollIntervalSeconds
         return """
+        dory_shutdown_clock() {
+          read DORY_UPTIME DORY_IDLE </proc/uptime || return 1
+          DORY_NOW=$(( ${DORY_UPTIME%.*} * 100 + 1${DORY_UPTIME#*.} - 100 ))
+        }
         dory_service_pids() {
           for DORY_PID in $(pidof "$1" 2>/dev/null); do [ "$DORY_PID" = 1 ] || echo "$DORY_PID"; done
         }
@@ -68,6 +72,8 @@ public enum GuestShutdownCommand {
         dory_shutdown() {
           DORY_DOCKER_PIDS=$(dory_service_pids dockerd)
           if [ -n "$DORY_DOCKER_PIDS" ]; then
+            dory_shutdown_clock || return 1
+            DORY_RELOAD_DEADLINE=$((DORY_NOW + \(Int(DoryEngineShutdownTiming.reloadGraceSeconds * 100))))
             DORY_CONFIG=/etc/docker/daemon.json
             DORY_CONFIG_TMP=$DORY_CONFIG.shutdown.$$
             [ -f "$DORY_CONFIG" ] && [ ! -L "$DORY_CONFIG" ] || { echo 'DORY-SHUTDOWN-FAILED: missing daemon config' >&2; return 1; }
@@ -82,13 +88,22 @@ public enum GuestShutdownCommand {
             fi
             if ! mv "$DORY_CONFIG_TMP" "$DORY_CONFIG"; then rm -f "$DORY_CONFIG_TMP"; return 1; fi
             kill -HUP $DORY_DOCKER_PIDS || { echo 'DORY-SHUTDOWN-FAILED: daemon reload signal' >&2; return 1; }
-            DORY_RELOAD=0
             while :; do
-              DORY_LIVE_RESTORE=$(timeout -k 1 1 /usr/local/bin/docker -H unix:///var/run/docker.sock info --format '{{.LiveRestoreEnabled}}') &&
+              [ -n "$(dory_service_pids dockerd)" ] || { echo 'DORY-SHUTDOWN-FAILED: dockerd exited before reload confirmation; task state unverified' >&2; return 1; }
+              dory_shutdown_clock || return 1
+              [ "$DORY_NOW" -lt "$DORY_RELOAD_DEADLINE" ] || { echo 'DORY-SHUTDOWN-FAILED: live-restore reload not confirmed' >&2; return 1; }
+              DORY_REMAINING=$((DORY_RELOAD_DEADLINE - DORY_NOW))
+              if [ "$DORY_REMAINING" -lt 2 ]; then sleep 0.01; continue; fi
+              DORY_PROBE=$((DORY_REMAINING / 2)); [ "$DORY_PROBE" -le 100 ] || DORY_PROBE=100
+              DORY_GRACE=$((DORY_REMAINING - DORY_PROBE)); [ "$DORY_GRACE" -le 100 ] || DORY_GRACE=100
+              DORY_PROBE=$(printf '%s.%02d' "$((DORY_PROBE / 100))" "$((DORY_PROBE % 100))")
+              DORY_GRACE=$(printf '%s.%02d' "$((DORY_GRACE / 100))" "$((DORY_GRACE % 100))")
+              DORY_LIVE_RESTORE=$(timeout -k "$DORY_GRACE" "$DORY_PROBE" /usr/local/bin/docker -H unix:///var/run/docker.sock info --format '{{.LiveRestoreEnabled}}') &&
                 [ "$DORY_LIVE_RESTORE" = false ] && break
-              DORY_RELOAD=$((DORY_RELOAD + 1))
-              [ "$DORY_RELOAD" -lt \(DoryEngineShutdownTiming.reloadPollAttempts) ] || { echo 'DORY-SHUTDOWN-FAILED: live-restore reload not confirmed' >&2; return 1; }
-              sleep \(interval)
+              dory_shutdown_clock || return 1
+              DORY_PAUSE=$((DORY_RELOAD_DEADLINE - DORY_NOW))
+              [ "$DORY_PAUSE" -le \(Int(DoryEngineShutdownTiming.pollIntervalSeconds * 100)) ] || DORY_PAUSE=\(Int(DoryEngineShutdownTiming.pollIntervalSeconds * 100))
+              [ "$DORY_PAUSE" -le 0 ] || sleep "$(printf '0.%02d' "$DORY_PAUSE")"
             done
           fi
           dory_stop_service dockerd \(DoryEngineShutdownTiming.dockerdPollAttempts) || return 1

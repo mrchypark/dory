@@ -77,6 +77,43 @@ struct GuestShutdownCommandTests {
         #expect(result.events[..<stopped].filter { $0 == "info" }.count == 3)
     }
 
+    @Test func unavailableSocketCanRecoverAfterTheFormerThreeAttempts() throws {
+        let result = try runShutdown(failure: "socket-delayed")
+        #expect(result.status == 0)
+        #expect(result.events.filter { $0 == "info" }.count == 17)
+        #expect(result.elapsedCentiseconds == 400)
+        #expect(result.events.contains("poweroff"))
+    }
+
+    @Test(arguments: [850, 950])
+    func socketRecoveryInTheLastTwoSecondsStillConfirmsReload(centiseconds: Int) throws {
+        let result = try runShutdown(failure: "socket-delayed-\(centiseconds)")
+        #expect(result.status == 0)
+        #expect(result.elapsedCentiseconds == centiseconds)
+        #expect(!result.events.contains("probe-budget-overrun"))
+        #expect(result.events.contains("poweroff"))
+    }
+
+    @Test(arguments: ["info-fail", "info-hang", "reload-unchanged", "validation-delayed"])
+    func reloadUsesOneTenSecondDeadlineAndRefusesCleanPoweroff(failure: String) throws {
+        let result = try runShutdown(failure: failure)
+        #expect(result.status != 0)
+        #expect(result.elapsedCentiseconds == 1_000)
+        #expect(!result.events.contains("stop 101"))
+        #expect(!result.events.contains("unmount"))
+        #expect(!result.events.contains("root-ro"))
+        #expect(!result.events.contains("poweroff"))
+    }
+
+    @Test func disappearedDaemonDoesNotProveItsTasksDrained() throws {
+        let result = try runShutdown(failure: "daemon-disappears")
+        #expect(result.status != 0)
+        #expect(result.events.filter { $0 == "info" }.count == 1)
+        #expect(!result.events.contains("stop 102"))
+        #expect(!result.events.contains("unmount"))
+        #expect(!result.events.contains("poweroff"))
+    }
+
     @Test(arguments: ["pid1", "pid1-and-agent"])
     func neverSignalsOrWaitsForPID1(scenario: String) throws {
         let result = try runShutdown(failure: scenario)
@@ -281,12 +318,16 @@ struct GuestShutdownCommandTests {
         #expect(process.terminationStatus == 0)
     }
 
-    private func runShutdown(failure: String = "", detached: Bool = false) throws -> (status: Int32, events: [String], configuration: Data, permissions: Int) {
+    private func runShutdown(failure: String = "", detached: Bool = false) throws -> (status: Int32, events: [String], configuration: Data, permissions: Int, elapsedCentiseconds: Int) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let trace = directory.appendingPathComponent("trace")
         try Data().write(to: trace)
+        let clock = directory.appendingPathComponent("uptime")
+        let ticks = directory.appendingPathComponent("ticks")
+        try "0.00 0.00\n".write(to: clock, atomically: true, encoding: .utf8)
+        try "0\n".write(to: ticks, atomically: true, encoding: .utf8)
         let configFile = directory.appendingPathComponent("daemon.json")
         if failure != "config-missing" {
             let config = failure == "config-malformed" ? #"{"live-restore":true,INVALID}"#
@@ -305,19 +346,37 @@ struct GuestShutdownCommandTests {
         DOCKER_UP=1; CONTAINERD_UP=1; AGENT_UP=1; RECLAIM_UP=1
         [ "$FAILURE" != no-daemon ] || DOCKER_UP=0
         trace() { printf '%s\n' "$*" >> "$TRACE"; }
-        timeout() { shift 3; case "$FAILURE:$1" in info-hang:docker|validate-timeout:dockerd) return 124 ;; esac; "$@"; }
-        sleep() { :; }
-        dockerd() { trace validate; [ "$FAILURE" != config-malformed ]; }
+        advance_clock() {
+          DORY_FAKE_NOW=$(( $(/bin/cat "$TICKS_FILE") + $1 ))
+          printf '%s\n' "$DORY_FAKE_NOW" >"$TICKS_FILE"
+          printf '%s.%02d 0.00\n' "$((DORY_FAKE_NOW / 100))" "$((DORY_FAKE_NOW % 100))" >"$CLOCK_FILE"
+        }
+        duration_ticks() { DORY_DURATION=$1; echo $(( ${DORY_DURATION%.*} * 100 + 1${DORY_DURATION#*.} - 100 )); }
+        timeout() {
+          DORY_TEST_GRACE=$2; DORY_TEST_PROBE=$3; shift 3
+          if [ "$1" = docker ]; then
+            DORY_TEST_LIMIT=$(( $(duration_ticks "$DORY_TEST_GRACE") + $(duration_ticks "$DORY_TEST_PROBE") ))
+            [ "$DORY_TEST_LIMIT" -le "$((1000 - $(/bin/cat "$TICKS_FILE")))" ] || { trace probe-budget-overrun; return 1; }
+            [ "$FAILURE" != info-hang ] || { advance_clock "$DORY_TEST_LIMIT"; return 124; }
+          fi
+          [ "$FAILURE:$1" != validate-timeout:dockerd ] || { advance_clock 300; return 124; }
+          "$@"
+        }
+        sleep() { [ "$1" = 0.1 ] || advance_clock "$(duration_ticks "$1")"; }
+        dockerd() { trace validate; [ "$FAILURE" != validation-delayed ] || advance_clock 300; [ "$FAILURE" != config-malformed ]; }
         docker() {
           trace info
           [ "$1 $2 $3 $4 $5" = '-H unix:///var/run/docker.sock info --format {{.LiveRestoreEnabled}}' ] || return 1
-          [ "$FAILURE" != info-fail ] || return 1
+          if [ "$FAILURE" = daemon-disappears ]; then : >"$DAEMON_GONE_FILE"; return 1; fi
+          if [ "$FAILURE" = socket-delayed ] && [ "$(/bin/cat "$TICKS_FILE")" -lt 400 ]; then return 1; fi
+          case "$FAILURE" in socket-delayed-*) [ "$(/bin/cat "$TICKS_FILE")" -ge "${FAILURE##*-}" ] || return 1 ;; esac
+          [ "$FAILURE" != info-fail ] && [ "$FAILURE" != validation-delayed ] || return 1
           if [ "$FAILURE" = reload-unchanged ] || { [ "$FAILURE" = reload-delayed ] && [ "$(grep -c '^info$' "$TRACE")" -lt 3 ]; }; then echo true; else echo false; fi
         }
         cat() { [ "$1" = /run/dory-storage-reclaim.pid ] && [ "$DETACHED" = 1 ] && echo 104; }
         pidof() {
           case "$1" in
-            dockerd) [ "$DOCKER_UP" = 1 ] && echo 101 ;;
+            dockerd) [ "$DOCKER_UP" = 1 ] && [ ! -f "$DAEMON_GONE_FILE" ] && echo 101 ;;
             containerd) [ "$CONTAINERD_UP" = 1 ] && echo 102 ;;
             dory-agent)
               case "$FAILURE" in pid1) echo 1 ;; pid1-and-agent) echo 1; [ "$AGENT_UP" = 1 ] && echo 103 ;; *) [ "$AGENT_UP" = 1 ] && echo 103 ;; esac ;;
@@ -346,12 +405,16 @@ struct GuestShutdownCommandTests {
             : GuestShutdownCommand.shutdownSequence()
         process.arguments = ["-c", stubs + "\n" + command
             .replacingOccurrences(of: "/etc/docker/daemon.json", with: configFile.path)
+            .replacingOccurrences(of: "/proc/uptime", with: clock.path)
             .replacingOccurrences(of: "/usr/local/bin/dockerd", with: "dockerd")
             .replacingOccurrences(of: "/usr/local/bin/docker", with: "docker")]
         var environment = ProcessInfo.processInfo.environment
         environment["TRACE"] = trace.path
         environment["FAILURE"] = failure
         environment["DETACHED"] = detached ? "1" : "0"
+        environment["CLOCK_FILE"] = clock.path
+        environment["TICKS_FILE"] = ticks.path
+        environment["DAEMON_GONE_FILE"] = directory.appendingPathComponent("daemon-gone").path
         process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -360,6 +423,7 @@ struct GuestShutdownCommandTests {
         let events = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n").map(String.init)
         let configuration = (try? Data(contentsOf: configFile)) ?? Data()
         let permissions = (try? FileManager.default.attributesOfItem(atPath: configFile.path)[.posixPermissions] as? Int) ?? 0
-        return (process.terminationStatus, events, configuration, permissions)
+        let elapsed = try Int(String(contentsOf: ticks, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        return (process.terminationStatus, events, configuration, permissions, elapsed)
     }
 }
